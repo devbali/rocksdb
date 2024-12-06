@@ -76,23 +76,25 @@ void LRUCacheManager::IncrementAllocation (int client_id, size_t capacity) {
   if (client_id == -1) return;
   FairDBCacheMetadata* element = GetElement(client_id);
   assert (element != nullptr);
-  //printf("Incr client %d: %d bytes. Is at %d, reserved %d\n", client_id, capacity, (int) element->capacity, (int) element->reserved_capacity);
+  // printf("Incr client %d: %d bytes. Is at %ld, reserved %d\n", client_id, capacity, (int) element->capacity, (int) element->reserved_capacity);
   element->capacity += capacity;
 }
 
 size_t LRUCacheManager::DecrementAllocation (int client_id, size_t capacity) {
   if (client_id == -1) return 0;
   FairDBCacheMetadata* element = GetElement(client_id);
+  // printf("Decr client %d: %d bytes. Is at %d, reserved %d\n", client_id, capacity, (int) element->capacity, (int) element->reserved_capacity);
+
   assert (element != nullptr);
-  //printf("Decr client %d: %d bytes. Is at %d, reserved %d\n", client_id, capacity, (int) element->capacity, (int) element->reserved_capacity);
-  if (element->capacity > capacity) {
-    element->capacity -= capacity;
-    return capacity;
-  } else {
-    size_t change = element->capacity;
-    element->capacity = 0;
-    return change;
-  }
+  assert (element->capacity >= capacity);
+
+  // if (element->capacity <= element->reserved_capacity) {
+  //   printf("[dev log] Cache is broken. Set your GDB breakpoint here.\n");
+  // }
+  // assert (element->capacity > element->reserved_capacity);
+
+  element->capacity -= capacity;
+  return capacity;
 }
 
 void LRUCacheManager::MarkActiveUser (int client_id) {
@@ -130,7 +132,7 @@ void LRUCacheManager::MarkActiveUser (int client_id) {
       FairDBCacheMetadata* meta = caches_iterator->second;
       meta->reserved_capacity = current_reservation_standard_;
     }
-    printf("Added an active user. Number of active users now is %d. The reserved capacity standard now is %d\n", M, current_reservation_standard_);
+    printf("[dev log] Added an active user. Number of active users now is %d. The reserved capacity standard now is %lu\n", M, current_reservation_standard_);
   }
 }
 
@@ -279,7 +281,7 @@ void LRUCacheShard::EraseUnRefEntries() {
       table_.Remove(old->key(), old->hash);
       old->SetInCache(false);
       assert(usage_ >= old->total_charge);
-      usage_ -= old->total_charge;
+      UsageDownBy(old);
       last_reference_list.push_back(old);
     }
   }
@@ -323,6 +325,20 @@ void LRUCacheShard::ApplyToSomeEntries(
                  h->helper);
       },
       index_begin, index_end);
+}
+
+void LRUCacheShard::UsageDownBy (LRUHandle* e) {
+  usage_ -= e->total_charge;
+  if (lru_manager_) {
+    lru_manager_->DecrementAllocation(e->client_id, e->total_charge);
+  }
+}
+
+void LRUCacheShard::UsageUpBy (LRUHandle* e) {
+  usage_ += e->total_charge;
+  if (lru_manager_) {
+    lru_manager_->IncrementAllocation(e->client_id, e->total_charge);
+  }
 }
 
 void LRUCacheShard::TEST_GetLRUList(LRUHandle** lru, LRUHandle** lru_low_pri,
@@ -376,8 +392,6 @@ void LRUCacheShard::LRU_Remove(LRUHandle* e) {
     assert(low_pri_pool_usage_ >= e->total_charge);
     low_pri_pool_usage_ -= e->total_charge;
   }
-  if (lru_manager_)
-    lru_manager_->DecrementAllocation(e->client_id, e->total_charge);
 }
 
 void LRUCacheShard::LRU_Insert(LRUHandle* e) {
@@ -419,9 +433,6 @@ void LRUCacheShard::LRU_Insert(LRUHandle* e) {
     }
     lru_bottom_pri_ = e;
   }
-  // Add this amount to the manager counts
-  if (lru_manager_)
-    lru_manager_->IncrementAllocation(e->client_id, e->total_charge);
   lru_usage_ += e->total_charge;
 }
 
@@ -461,7 +472,7 @@ void LRUCacheShard::EvictFromLRU(size_t charge,
     if (lru_manager_) {
       FairDBCacheMetadata* old_meta = lru_manager_->GetElement(old->client_id);
       //printf("checking old client %d for reserving: %d < %d\n", old->client_id, (int) old_meta->capacity, (int) old_meta->reserved_capacity);
-      if (old_meta->capacity < old_meta->reserved_capacity) {
+      if (old_meta->capacity <= old_meta->reserved_capacity) {
         head = old;
         continue;
       }
@@ -473,7 +484,7 @@ void LRUCacheShard::EvictFromLRU(size_t charge,
     table_.Remove(old->key(), old->hash);
     old->SetInCache(false);
     assert(usage_ >= old->total_charge);
-    usage_ -= old->total_charge;
+    UsageDownBy(old);
     deleted->push_back(old);
   }
 
@@ -541,19 +552,33 @@ Status LRUCacheShard::InsertItem(LRUHandle* e, LRUHandle** handle) {
       // Insert into the cache. Note that the cache might get larger than its
       // capacity if not enough space was freed up.
       LRUHandle* old = table_.Insert(e);
-      usage_ += e->total_charge;
+      UsageUpBy(e);
+
       if (old != nullptr) {
         s = Status::OkOverwritten();
         assert(old->InCache());
-        old->SetInCache(false);
-        if (!old->HasRefs()) {
-          // old is on LRU because it's in cache and its reference count is 0.
-          LRU_Remove(old);
-          assert(usage_ >= old->total_charge);
-          usage_ -= old->total_charge;
-          last_reference_list.push_back(old);
+
+        bool evict_old = true;
+        if (lru_manager_) {
+          FairDBCacheMetadata* old_meta = lru_manager_->GetElement(old->client_id);
+          if (old_meta->capacity <= old_meta->reserved_capacity) {
+            evict_old = false;
+          }
+        }
+        
+
+        if ( evict_old ) {
+          old->SetInCache(false);
+          if (!old->HasRefs()) {
+            // old is on LRU because it's in cache and its reference count is 0.
+            LRU_Remove(old);
+            assert(usage_ >= old->total_charge);
+            UsageDownBy(old);
+            last_reference_list.push_back(old);
+          }
         }
       }
+
       if (handle == nullptr) {
         LRU_Insert(e);
       } else {
@@ -645,12 +670,8 @@ bool LRUCacheShard::Release(LRUHandle* e, bool /*useful*/,
     if (must_free && was_in_cache) {
       // The item is still in cache, and nobody else holds a reference to it.
       if (usage_ > capacity_ || erase_if_last_ref) {
-
-        // TODO: this was assuming a cache will never be resized to being below its original size
-        // Look for more such assumptions
-
         // The LRU list must be empty since the cache is full.
-        //assert(lru_.next == &lru_ || erase_if_last_ref);
+        assert(lru_.next == &lru_ || erase_if_last_ref);
 
         // Take this opportunity and remove the item.
         table_.Remove(e->key(), e->hash);
@@ -664,7 +685,7 @@ bool LRUCacheShard::Release(LRUHandle* e, bool /*useful*/,
     // If about to be freed, then decrement the cache usage.
     if (must_free) {
       assert(usage_ >= e->total_charge);
-      usage_ -= e->total_charge;
+      UsageDownBy(e);
     }
   }
 
@@ -753,7 +774,7 @@ LRUHandle* LRUCacheShard::CreateStandalone(const Slice& key, uint32_t hash,
         e = nullptr;
       }
     } else {
-      usage_ += e->total_charge;
+      UsageUpBy(e);
     }
   }
 
@@ -774,7 +795,7 @@ void LRUCacheShard::Erase(const Slice& key, uint32_t hash) {
         // The entry is in LRU since it's in hash and has no external references
         LRU_Remove(e);
         assert(usage_ >= e->total_charge);
-        usage_ -= e->total_charge;
+        UsageDownBy(e);
         last_reference = true;
       }
     }
@@ -886,6 +907,7 @@ std::shared_ptr<Cache> LRUCacheOptions::MakeSharedCache() const {
 
   if (opts.fairdb_use_pooled) {
     if (rocksdb::lru_cache::lru_cache_manager == nullptr) {
+      printf("OPTS CAPACITY:%lu\n", opts.capacity);
       rocksdb::lru_cache::lru_cache_manager = new rocksdb::lru_cache::LRUCacheManager(opts.request_additional_delay_microseconds, opts.read_io_mbps, opts.additional_rampups_supported, opts);
     }
     rocksdb::lru_cache::lru_cache_manager->AddCache(opts.client_id);
