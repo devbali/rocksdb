@@ -119,8 +119,13 @@ void LRUCacheManager::MarkActiveUser (int client_id) {
       return;
     }
 
+    size_t denominator = M + K;
+    if (denominator > N) {
+      denominator = N;
+    }
+
     ssize_t reserved_needed = TOTAL / N 
-      - (request_additional_delay_microseconds * ((read_io_mbps * 1024 * 1024) / 1000000)) / (M + K);
+      - (request_additional_delay_microseconds * ((read_io_mbps * 1024 * 1024) / 1000000)) / denominator;
     
     if (reserved_needed < 0) {
       current_reservation_standard_ = 0;
