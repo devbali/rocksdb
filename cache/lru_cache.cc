@@ -44,7 +44,9 @@ static LRUCacheManager* lru_cache_manager = nullptr;
 LRUCacheManager::LRUCacheManager (size_t request_additional_delay_microseconds_, size_t read_io_mbps_, size_t K, LRUCacheOptions &opts) :
     request_additional_delay_microseconds(request_additional_delay_microseconds_),
     read_io_mbps(read_io_mbps_),
-    additional_bursting_supported(K) {
+    additional_bursting_supported(K),
+    faircache_max_request_rate(opts.faircache_max_request_rate),
+    faircache_record_size(opts.faircache_record_size) {
   manager_mutex_ = new rocksdb::DMutex(true);
   caches = new std::map<int, FairDBCacheMetadata*> ();
   opts.manager_ptr = this;
@@ -111,9 +113,6 @@ void LRUCacheManager::MarkActiveUser (int client_id) {
     size_t TOTAL = main_cache->GetCapacity();
     size_t K = additional_bursting_supported;
     size_t M = active_users.size();
-    // RAD = (40-R) * 1/(1600 / (M + 2))
-    // TOTAL/N - R = RAD * (rio / M + 2)
-    // TOTAL/N - RAD * (rio / M + 2) = R
 
     if (M + K == 0 || N == 0) {
       return;
@@ -124,15 +123,24 @@ void LRUCacheManager::MarkActiveUser (int client_id) {
       denominator = N;
     }
 
-    ssize_t reserved_needed = TOTAL / N 
-      - (request_additional_delay_microseconds * ((read_io_mbps * 1024 * 1024) / 1000000)) / denominator;
-    
-    if (reserved_needed < 0) {
+    size_t fair_read_io_bandwidth = (read_io_mbps * 1024 * 1024) / denominator; // bytes per second
+    size_t fair_share_cache = TOTAL / N;
+
+    ssize_t reserved_needed = (
+      (faircache_max_request_rate * faircache_record_size * faircache_record_size)
+        + (faircache_max_request_rate * faircache_record_size * fair_share_cache)
+        - (fair_share_cache * fair_read_io_bandwidth)
+        - ((request_additional_delay_microseconds * fair_read_io_bandwidth * faircache_max_request_rate * faircache_record_size) / 1000000)
+    ) / (faircache_max_request_rate * faircache_record_size - fair_read_io_bandwidth);
+
+    if (reserved_needed <= 0) {
       current_reservation_standard_ = 0;
+    } else if (reserved_needed >= fair_share_cache) {
+      current_reservation_standard_ = fair_share_cache;
     } else {
       current_reservation_standard_ = reserved_needed;
     }
-    
+
     for (auto caches_iterator = caches->begin(); caches_iterator != caches->end(); ++caches_iterator) {
       FairDBCacheMetadata* meta = caches_iterator->second;
       meta->reserved_capacity = current_reservation_standard_;
@@ -140,6 +148,50 @@ void LRUCacheManager::MarkActiveUser (int client_id) {
     printf("[dev log] Added an active user. Number of active users now is %d. The reserved capacity standard now is %lu\n", M, current_reservation_standard_);
   }
 }
+
+// void LRUCacheManager::MarkActiveUser (int client_id) {
+//   // TODO (devbali): Implement a way to have user be deactivated too
+//   if (client_id == -1) return;
+
+//   if (active_users.find(client_id) == active_users.end()) {
+//     // client id not in active users
+//     DMutex* manager_mutex__ = (DMutex*) manager_mutex_;
+//     DMutexLock l(*manager_mutex__);
+//     active_users.emplace(client_id);
+
+//     size_t N = caches->size();
+//     size_t TOTAL = main_cache->GetCapacity();
+//     size_t K = additional_bursting_supported;
+//     size_t M = active_users.size();
+//     // RAD = (40-R) * 1/(1600 / (M + 2))
+//     // TOTAL/N - R = RAD * (rio / M + 2)
+//     // TOTAL/N - RAD * (rio / M + 2) = R
+
+//     if (M + K == 0 || N == 0) {
+//       return;
+//     }
+
+//     size_t denominator = M + K;
+//     if (denominator > N) {
+//       denominator = N;
+//     }
+
+//     ssize_t reserved_needed = TOTAL / N 
+//       - (request_additional_delay_microseconds * ((read_io_mbps * 1024 * 1024) / 1000000)) / denominator;
+    
+//     if (reserved_needed < 0) {
+//       current_reservation_standard_ = 0;
+//     } else {
+//       current_reservation_standard_ = reserved_needed;
+//     }
+    
+//     for (auto caches_iterator = caches->begin(); caches_iterator != caches->end(); ++caches_iterator) {
+//       FairDBCacheMetadata* meta = caches_iterator->second;
+//       meta->reserved_capacity = current_reservation_standard_;
+//     }
+//     printf("[dev log] Added an active user. Number of active users now is %d. The reserved capacity standard now is %lu\n", M, current_reservation_standard_);
+//   }
+// }
 
 LRUCacheManager::~LRUCacheManager () {
   for (std::map<int, FairDBCacheMetadata*>::iterator it = caches->begin(); it != caches->end(); ++it) {

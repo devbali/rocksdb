@@ -264,6 +264,8 @@ struct LRUCacheOptions : public ShardedCacheOptions {
   size_t request_additional_delay_microseconds;
   size_t read_io_mbps;
   size_t additional_rampups_supported;
+  size_t faircache_max_request_rate;
+  size_t faircache_record_size;
   lru_cache::LRUCacheManager* manager_ptr = nullptr;
 
   LRUCacheOptions() {}
@@ -327,7 +329,7 @@ namespace lru_cache {
 
       inline std::map<int, FairDBCacheMetadata*>* GetAllocations () { return caches; }
       inline std::shared_ptr<LRUCache> GetMainCache () { return main_cache; }
-      inline size_t NumClients () { return caches->size(); }
+      inline size_t NumClients () { return caches ? caches->size() : 0; }
 
     private:
       size_t caches_size;
@@ -340,6 +342,8 @@ namespace lru_cache {
       size_t request_additional_delay_microseconds;
       size_t read_io_mbps;
       size_t additional_bursting_supported;
+      size_t faircache_max_request_rate;
+      size_t faircache_record_size;
   };
 }
 
